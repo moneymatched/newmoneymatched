@@ -1,0 +1,339 @@
+import { makeAutoObservable, runInAction } from 'mobx';
+import type { UnclaimedProperty } from '../types/Property';
+import type { SearchPropertyResult } from '../services/awsClient';
+import { convertDatabaseProperty } from '../utils/propertyConverter';
+
+interface CartData {
+  items: string[];
+  total: number;
+  count: number;
+}
+
+export interface CartItem {
+  property: UnclaimedProperty;
+  addedAt: Date;
+}
+
+export interface CheckoutData {
+  firstName: string;
+  lastName: string;
+  email: string;
+  phone: string;
+  ssn: string;
+  address: {
+    street1: string;
+    street2?: string;
+    city: string;
+    state: string;
+    zipCode: string;
+  };
+  notes?: string;
+}
+
+export class CartStore {
+  // Observable state
+  items: CartItem[] = [];
+  isCheckoutOpen = false;
+  checkoutStep = 1; // 1: Review Cart, 2: Enter Details, 3: Confirmation
+  checkoutData: CheckoutData = {
+    firstName: '',
+    lastName: '',
+    email: '',
+    phone: '',
+    ssn: '',
+    address: {
+      street1: '',
+      street2: '',
+      city: '',
+      state: 'CA',
+      zipCode: ''
+    },
+    notes: ''
+  };
+
+  constructor() {
+    makeAutoObservable(this);
+  }
+
+  // Actions
+  addToCart = (property: UnclaimedProperty) => {
+    // Check if property is already in cart
+    const existingItem = this.items.find(item => item.property.id === property.id);
+    if (existingItem) {
+      return; // Already in cart, don't add duplicate
+    }
+
+    runInAction(() => {
+      this.items.push({
+        property,
+        addedAt: new Date()
+      });
+    });
+  };
+
+  removeFromCart = (propertyId: string) => {
+    runInAction(() => {
+      this.items = this.items.filter(item => item.property.id !== propertyId);
+    });
+  };
+
+  clearCart = () => {
+    runInAction(() => {
+      this.items = [];
+    });
+  };
+
+  openCheckout = () => {
+    this.isCheckoutOpen = true;
+    this.checkoutStep = 1;
+  };
+
+  closeCheckout = () => {
+    this.isCheckoutOpen = false;
+    this.checkoutStep = 1;
+  };
+
+  setCheckoutStep = (step: number) => {
+    this.checkoutStep = step;
+  };
+
+  updateCheckoutData = (data: Partial<CheckoutData>) => {
+    runInAction(() => {
+      this.checkoutData = { ...this.checkoutData, ...data };
+    });
+  };
+
+  updateCheckoutAddress = (address: Partial<CheckoutData['address']>) => {
+    runInAction(() => {
+      this.checkoutData.address = { ...this.checkoutData.address, ...address };
+    });
+  };
+
+  // Prepopulate address from property data
+  prepopulateFromProperty = (property: UnclaimedProperty) => {
+    // Helper function to check if a field has meaningful content
+    const hasContent = (field: string | undefined | null): boolean => {
+      return field != null && field.trim().length > 0;
+    };
+
+    // We need at least city OR street1 to proceed with prepopulation
+    const hasCity = hasContent(property.ownerCity);
+    const hasStreet = hasContent(property.ownerStreet1);
+    
+    if (hasCity || hasStreet) {
+      runInAction(() => {
+        this.checkoutData.address = {
+          // ownerStreet1 now contains the full address from the database response
+          street1: hasContent(property.ownerStreet1) ? property.ownerStreet1!.trim() : '',
+          street2: hasContent(property.ownerStreet2) ? property.ownerStreet2!.trim() : '',
+          city: hasContent(property.ownerCity) ? property.ownerCity!.trim() : '',
+          state: hasContent(property.ownerState) ? property.ownerState!.trim() : 'CA',
+          zipCode: hasContent(property.ownerZip) ? property.ownerZip!.trim() : ''
+        };
+      });
+    }
+  };
+
+  resetCheckoutData = () => {
+    runInAction(() => {
+      this.checkoutData = {
+        firstName: '',
+        lastName: '',
+        email: '',
+        phone: '',
+        ssn: '',
+        address: {
+          street1: '',
+          street2: '',
+          city: '',
+          state: 'CA',
+          zipCode: ''
+        },
+        notes: ''
+      };
+    });
+  };
+
+  // Computed values
+  get itemCount() {
+    return this.items.length;
+  }
+
+  get totalAmount() {
+    return this.items.reduce((total, item) => total + item.property.currentCashBalance, 0);
+  }
+
+  get hasItems() {
+    return this.items.length > 0;
+  }
+
+  get isPropertyInCart() {
+    return (propertyId: string) => {
+      return this.items.some(item => item.property.id === propertyId);
+    };
+  }
+
+  // Email validation helper
+  isValidEmail(email: string): boolean {
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    return emailRegex.test(email.trim());
+  }
+
+  // SSN validation helper
+  isValidSSN(ssn: string): boolean {
+    // Remove all non-digit characters
+    const cleanSSN = ssn.replace(/\D/g, '');
+    // Check if it's exactly 9 digits and not all the same digit
+    return cleanSSN.length === 9 && !/^(\d)\1{8}$/.test(cleanSSN);
+  }
+
+  // Format SSN for display (XXX-XX-XXXX)
+  formatSSN(ssn: string): string {
+    const cleanSSN = ssn.replace(/\D/g, '');
+    if (cleanSSN.length === 0) return '';
+    if (cleanSSN.length <= 3) return cleanSSN;
+    if (cleanSSN.length <= 5) return `${cleanSSN.slice(0, 3)}-${cleanSSN.slice(3)}`;
+    return `${cleanSSN.slice(0, 3)}-${cleanSSN.slice(3, 5)}-${cleanSSN.slice(5, 9)}`;
+  }
+
+  // Phone number validation helper
+  isValidPhone(phone: string): boolean {
+    if (!phone) return true; // Phone is optional
+    // Remove all non-digit characters
+    const digits = phone.replace(/\D/g, '');
+    // Accept 10 digits (US format without country code) or 11 digits (US format with country code)
+    return digits.length === 10 || digits.length === 11;
+  }
+
+  // Format phone number for display (XXX) XXX-XXXX
+  formatPhone(phone: string): string {
+    const digits = phone.replace(/\D/g, '');
+    if (digits.length === 0) return '';
+    if (digits.length <= 3) return `(${digits}`;
+    if (digits.length <= 6) return `(${digits.slice(0, 3)}) ${digits.slice(3)}`;
+    if (digits.length <= 10) return `(${digits.slice(0, 3)}) ${digits.slice(3, 6)}-${digits.slice(6)}`;
+    // Handle 11 digits (with country code)
+    if (digits.length === 11 && digits.startsWith('1')) {
+      return `(${digits.slice(1, 4)}) ${digits.slice(4, 7)}-${digits.slice(7)}`;
+    }
+    return phone; // Return original if format is unclear
+  }
+
+  // Mask SSN for display (XXX-XX-1234)
+  maskSSN(ssn: string): string {
+    const cleanSSN = ssn.replace(/\D/g, '');
+    if (cleanSSN.length < 9) return this.formatSSN(cleanSSN);
+    return `XXX-XX-${cleanSSN.slice(5, 9)}`;
+  }
+
+  get canProceedToNextStep() {
+    switch (this.checkoutStep) {
+      case 1:
+        return this.hasItems;
+      case 2:
+        return this.checkoutData.firstName.trim() !== '' &&
+               this.checkoutData.lastName.trim() !== '' &&
+               this.checkoutData.email.trim() !== '' &&
+               this.isValidEmail(this.checkoutData.email) &&
+               this.checkoutData.ssn.trim() !== '' &&
+               this.isValidSSN(this.checkoutData.ssn) &&
+               this.checkoutData.address.street1.trim() !== '' &&
+               this.checkoutData.address.city.trim() !== '' &&
+               this.checkoutData.address.state.trim() !== '' &&
+               this.checkoutData.address.zipCode.trim() !== '';
+      case 3:
+        return true;
+      default:
+        return true;
+    }
+  }
+
+  get sortedItems() {
+    return [...this.items].sort((a, b) => b.addedAt.getTime() - a.addedAt.getTime());
+  }
+
+  // URL-based cart sharing functionality
+  generateShareUrl = (): string => {
+    const cartData = {
+      // Only store essential data
+      items: this.items.map(item => item.property.id),
+      // Optional: store total for preview
+      total: this.totalAmount,
+      count: this.itemCount
+    };
+    
+    // Compress the data
+    const compressed = this.compressCartData(cartData);
+    const encoded = btoa(compressed);
+    
+    return `${window.location.origin}/shared-cart/${encoded}`;
+  };
+  
+  // Load cart from URL
+  loadFromShareUrl = async (encodedData: string): Promise<boolean> => {
+    try {
+      const compressed = atob(encodedData);
+      const cartData = this.decompressCartData(compressed);
+      
+      if (!cartData || !cartData.items || !Array.isArray(cartData.items)) {
+        return false;
+      }
+      
+      // Clear current cart
+      this.clearCart();
+      
+      // Fetch property details and rebuild cart
+      const properties = await this.fetchPropertiesByIds(cartData.items);
+      
+      if (properties.length === 0) {
+        return false;
+      }
+      
+      // Add properties to cart
+      properties.forEach(property => {
+        this.addToCart(property);
+      });
+      
+      return true;
+    } catch (error) {
+      console.error('Failed to load shared cart:', error);
+      return false;
+    }
+  };
+  
+  // Compress cart data to reduce URL length
+  private compressCartData = (data: CartData): string => {
+    return JSON.stringify(data);
+  };
+  
+  // Decompress cart data
+  private decompressCartData = (compressed: string): CartData | null => {
+    try {
+      return JSON.parse(compressed);
+    } catch {
+      return null;
+    }
+  };
+  
+
+  // Fetch properties by IDs (reuse existing search infrastructure)
+  private fetchPropertiesByIds = async (propertyIds: string[]): Promise<UnclaimedProperty[]> => {
+    try {
+      // Use existing property search service
+      const response = await fetch('/.netlify/functions/property-search/properties-by-ids', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          propertyIds: propertyIds
+        })
+      });
+      
+      const data = await response.json();
+      // Convert properties from underscore_case to camelCase using utility function
+      return (data.properties || []).map((property: SearchPropertyResult) => convertDatabaseProperty(property));
+    } catch (error) {
+      console.error('Failed to fetch properties:', error);
+      return [];
+    }
+  };
+} 
